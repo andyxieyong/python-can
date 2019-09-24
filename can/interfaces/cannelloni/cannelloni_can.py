@@ -122,7 +122,7 @@ class CannelloniBus(BusABC):
 
     __seq_no = 0x0
 
-    def __init__(self, ap_address, sleep_after_open=_SLEEP_AFTER_SOCKET_OPEN, **kwargs):
+    def __init__(self, ap_address, sleep_after_open=_SLEEP_AFTER_SOCKET_OPEN, do_open=True, disable_rx = False, **kwargs):
         """
         :param tuple ap_address:
             ip_address and port from the WiFi Access Point
@@ -139,19 +139,21 @@ class CannelloniBus(BusABC):
         self.__ap_address = ap_address
         self.__socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self.__socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.__socket.bind(('192.168.4.2', 3333))
-
+        self.__socket.bind(('0.0.0.0', 3333))
+        self.__disable_rx = disable_rx
         self._udp_rx_packet_buf = bytearray()
         self.tx_buffer = queue.Queue()
         self.rx_buffer = queue.Queue()    # TODO: queue or deque(maybe faster?)
 
         # TODO: set bit rate
 
-        self.open()
+        if do_open:
+            self.open()
         time.sleep(sleep_after_open)
 
-        self.__rcv_internal_thread = MyThread(func=self._recv_internal)
-        self.__rcv_internal_thread.start()
+        if not self.__disable_rx:
+            self.__rcv_internal_thread = MyThread(func=self._recv_internal)
+            self.__rcv_internal_thread.start()
 
         self.timer = MyTimer(0.03)
         self.timer.run()
@@ -224,7 +226,10 @@ class CannelloniBus(BusABC):
 
         ready = select.select([self.__socket], [], [], timeout)
         if ready[0]:
-            self._udp_rx_packet_buf, server = self.__socket.recvfrom(self.CANNELLONI_UDP_RX_PACKET_BUF_LEN)
+            try:
+                self._udp_rx_packet_buf, server = self.__socket.recvfrom(self.CANNELLONI_UDP_RX_PACKET_BUF_LEN)
+            except OSError:
+                return None, False
         else:
             return None, False
 
@@ -240,7 +245,7 @@ class CannelloniBus(BusABC):
             return None, False
 
         if rcv_hdr.version != self.CANNELLONI_FRAME_VERSION:
-            print("Recieved wrong cannelloni frame verion", file=sys.stderr)
+            print("Recieved wrong cannelloni frame version", file=sys.stderr)
             return None, False
 
         if rcv_hdr.op_code != OpCodes.DATA.value:
@@ -378,9 +383,9 @@ class CannelloniBus(BusABC):
         return self.__socket
 
     def shutdown(self):
-        time.sleep(2)
-        self.__rcv_internal_thread.cancel()
         self.__snd_internal_thread.cancel()
+        if not self.__disable_rx:
+            self.__rcv_internal_thread.cancel()
         #self.__rcv_internal_thread.join()
         #self.__snd_internal_thread.join()
 
