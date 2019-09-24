@@ -10,13 +10,8 @@ Interface for WiFi compatible interfaces with cannelloni can.
 from __future__ import absolute_import
 
 import logging
-import sys
-import enum
 import struct
-import binascii
-import select
 import time
-import threading
 import queue
 from can.bus import BusState
 from .cannelloni import Cannelloni
@@ -25,7 +20,6 @@ from .basic import *
 from can import BusABC, Message
 
 logger = logging.getLogger(__name__)    # TODO: only one logger
-LOG = logging.getLogger(__name__)
 
 try:        # TODO: useless because always available with python ?
     import socket
@@ -36,31 +30,10 @@ except ImportError:
     import socket
 
 
-class CannelloniDataPacket(object):
-    """
-    Header for one Cannelloni UDP Packet
-    """
-    def __init__(self):
-        self.version = 0
-        self.op_code = 0
-        self.seq_no = 0
-        self.count = 0
 
 
-class MyThread(threading.Thread):
-    def __init__(self, func, arg=None):
-        threading.Thread.__init__(self)
-        self.__running = threading.Event()
-        self.__running.set()
-        self.__func = func
-        self.__arg = arg
 
-    def run(self):
-        while self.__running.is_set():
-            self.__func()
 
-    def cancel(self):
-        self.__running.clear()
 
 
 
@@ -78,10 +51,9 @@ cannelloni_bitrates = {
 
 class CannelloniBus(BusABC):
     """
-    cannelloni interface (WiFi)
+    CAN Bus implementation for the cannelloni interface (WiFi)
     """
 
-    _SLEEP_AFTER_SOCKET_OPEN = 1  # in seconds
 
     CANNELLONI_UDP_RX_PACKET_BUF_LEN = 1600  # Defines the size of the Receiving buffer
     CANNELLONI_DATA_PACKET_BASE_SIZE = 5  # Defines the Base size of an Cannelloni Data Packet
@@ -94,7 +66,6 @@ class CannelloniBus(BusABC):
     __SLEEP_AFTER_SOCKET_OPEN = 1  # waiting time in seconds
     __seq_no = 0x0  # first Cannelloni Data Packet sequence number (last sequence number is 0xff)
 
-    __seq_no = 0x0
 
     def __init__(self, ap_address, state=BusState.ACTIVE, bitrate=500000, can_mode=CANNELLONI_CAN_MODE_NORMAL,
                  filter=False, is_extended=False, start_id=0x0, end_id=0x7FF,
@@ -121,8 +92,6 @@ class CannelloniBus(BusABC):
             Time to wait in seconds after opening socket connection to Cannelloni Interface
         """
 
-        if not ap_address:  # if None or empty
-            raise TypeError("Must specify IP Address and Port from the Access Point.")
 
         if not ap_address:  # if None or empty
             raise TypeError("Must specify IP Address and Port of the Access Point.")
@@ -170,21 +139,21 @@ class CannelloniBus(BusABC):
         time.sleep(sleep_after_open)
 
         if not self.__disable_rx:
-            self.__rcv_internal_thread = MyThread(func=self._recv_internal)
+            self.__rcv_internal_thread = CANNELLONIInternalThread(func=self._recv_internal)
             self.__rcv_internal_thread.start()
 
         # start the send timer
         self.timer = CANNELLONISendTimer(0.03)  # send messages in the given interval
         self.timer.run()
 
-        self.__snd_internal_thread = MyThread(func=self._send_internal)
+        self.__snd_internal_thread = CANNELLONIInternalThread(func=self._send_internal)
         self.__snd_internal_thread.start()
 
         super(CannelloniBus, self).__init__(ap_address, **kwargs)
 
     def open(self):
         """
-                Init the CAN channel on the cannelloni device.
+        Init the CAN channel on the cannelloni device.
         """
         self.__cannelloni.init_can(bitrate=self.__config["bitrate"],
                                    can_mode=self.__config["can_mode"],
