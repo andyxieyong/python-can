@@ -66,7 +66,7 @@ class TestCannelloniRx(unittest.TestCase):
         self.bus.send(msg)
         time.sleep(0.5) # give sender thread some time to push message to socket
         (data, address) = self.socket.recvfrom(self.bus.CANNELLONI_UDP_RX_PACKET_BUF_LEN)
-        self.assertEqual(data, b'\x02\x00\xff\x00\x01\x00\x00\x03\xc0\x05\x04\x00\x00 \x00')  # TODO: try can frame
+        self.assertEqual(data, b'\x02\x00\x00\x00\x01\x00\x00\x03\xc0\x05\x04\x00\x00 \x00')  # TODO: try can frame
 
 
     def test_send_extended(self):
@@ -78,7 +78,7 @@ class TestCannelloniRx(unittest.TestCase):
         self.bus.send(msg)
         time.sleep(0.5) # give sender thread some time to push message to socket
         (data, address) = self.socket.recvfrom(self.bus.CANNELLONI_UDP_RX_PACKET_BUF_LEN)
-        self.assertEqual(data, b'\x02\x00\xff\x00\x01\x97\xfe\x00\xba\x05\x04\x00\x00 \x00')  # TODO: try can frame
+        self.assertEqual(data, b'\x02\x00\x00\x00\x01\x97\xfe\x00\xba\x05\x04\x00\x00 \x00')  # TODO: try can frame
 
 
 if __name__ == "__main__":

@@ -18,7 +18,9 @@ import select
 import time
 import threading
 import queue
-
+from can.bus import BusState
+from .cannelloni import Cannelloni
+from .basic import *
 
 from can import BusABC, Message
 
@@ -34,15 +36,6 @@ except ImportError:
     import socket
 
 
-class OpCodes(enum.Enum):
-    """
-    Op Codes for the Cannelloni Data Packet.
-    """
-    DATA = 0
-    ACK = 1
-    NACK = 2
-
-
 class CannelloniDataPacket(object):
     """
     Header for one Cannelloni UDP Packet
@@ -52,30 +45,6 @@ class CannelloniDataPacket(object):
         self.op_code = 0
         self.seq_no = 0
         self.count = 0
-
-
-class MyTimer(object):
-    def __init__(self, t):
-        self.__event = threading.Event()
-        self.__interval = t
-        self.__timer = threading.Timer(self.__interval, self.__set_event)
-
-    def run(self):
-        self.__timer.start()
-
-    def reset(self):
-        self.__timer.cancel()
-        self.__timer = threading.Timer(self.__interval, self.__set_event)
-        self.__timer.start()
-
-    def __set_event(self):
-        self.__event.set()
-
-    def clear(self):
-        self.__event.clear()
-
-    def is_present(self):
-        return self.__event.is_set()
 
 
 class MyThread(threading.Thread):
@@ -94,6 +63,19 @@ class MyThread(threading.Thread):
         self.__running.clear()
 
 
+
+cannelloni_bitrates = {
+    1000000: CANNELLONI_BAUD_1M,   # 1 MBit/s
+    800000: CANNELLONI_BAUD_800K,  # 800 kBit/s
+    500000: CANNELLONI_BAUD_500K,  # 500 kBit/s
+    250000: CANNELLONI_BAUD_250K,  # 250 kBit/s
+    125000: CANNELLONI_BAUD_125K,  # 125 kBit/s
+    100000: CANNELLONI_BAUD_100K,  # 100 kBit/s
+    50000: CANNELLONI_BAUD_50K,    # 50 kBit/s
+    25000: CANNELLONI_BAUD_25K     # 25 kBit/s
+}
+
+
 class CannelloniBus(BusABC):
     """
     cannelloni interface (WiFi)
@@ -105,47 +87,83 @@ class CannelloniBus(BusABC):
     CANNELLONI_DATA_PACKET_BASE_SIZE = 5  # Defines the Base size of an Cannelloni Data Packet
     CANNELLONI_FRAME_VERSION = 2  # Defines the used Cannelloni Frame Version
 
-    CAN_EFF_FLAG = 0x80000000  # Flag for Extended Frame Format (29bit arbitration-ID)
-    CAN_RTR_FLAG = 0x40000000  # Flag for Remote Transmit Request frame
-    CAN_ERR_FLAG = 0x20000000  # Flag for Error Frame
 
-    CAN_SFF_MASK = 0x000007FF  # Mask for the Standard Frame Format
-    CAN_EFF_MASK = 0x1FFFFFFF  # Mask for the Extended Frame Format
-    CAN_ERR_MASK = 0x1FFFFFFF  # Mask for the Error Frame
+    ACCEPTANCE_CODE_ALL = 0
+    ACCEPTANCE_MASK_ALL = 0xFFFFFFFF
 
-    CAN_MSG_FLAG_NONE = 0x00  # No message flags (Standard Frame Format)
-    CAN_MSG_FLAG_EXTD = 0x01  # Extended Frame Format (29bit arbitration-ID)
-    CAN_MSG_FLAG_RTR = 0x02  # Message is a Remote Transmit Request
-    CAN_MSG_FLAG_SS = 0x04  # Transmit as a Single Shot Transmission
-    CAN_MSG_FLAG_SELF = 0x08  # Transmit as a Self Reception Request
-    CAN_MSG_FLAG_DLC_NON_COMP = 0x10  # Message's Data length code is larger than 8. Will break compliance with CAN2.0B
+    __SLEEP_AFTER_SOCKET_OPEN = 1  # waiting time in seconds
+    __seq_no = 0x0  # first Cannelloni Data Packet sequence number (last sequence number is 0xff)
 
     __seq_no = 0x0
 
-    def __init__(self, ap_address, sleep_after_open=_SLEEP_AFTER_SOCKET_OPEN, do_open=True, disable_rx = False, **kwargs):
+    def __init__(self, ap_address, state=BusState.ACTIVE, bitrate=500000, can_mode=CANNELLONI_CAN_MODE_NORMAL,
+                 filter=False, is_extended=False, start_id=0x0, end_id=0x7FF,
+                 sleep_after_open=__SLEEP_AFTER_SOCKET_OPEN, do_open=True, disable_rx=False, **kwargs):
         """
         :param tuple ap_address:
-            ip_address and port from the WiFi Access Point
+            ip_address and port of the WiFi Access Point
             Must not be empty.
-        :param str btr:
-            BTR register value to set custom can speed
+        :param bus.BusState state:
+            Bus state of the Controller. Default is ACTIVE
+        :param int bitrate:
+            Bit rate in bit/s. Default is 500000 bit/s
+        :param bool filter:
+            Filter CAN Messages (arbitration ID). True := filter messages, False := no Message filtering
+        :param bool is_extended:
+            Extended arbitration ID.
+        :param int start_id:
+            Specifies the arbitration ID from which to filter.
+            default: 0x0
+        :param int end_id:
+            Specifies the arbitration ID up to which to filter.
+            default: 0x7FF (standard frame format)
         :param float sleep_after_open:
-            Time to wait in seconds after opening socket connection
+            Time to wait in seconds after opening socket connection to Cannelloni Interface
         """
 
         if not ap_address:  # if None or empty
             raise TypeError("Must specify IP Address and Port from the Access Point.")
 
+        if not ap_address:  # if None or empty
+            raise TypeError("Must specify IP Address and Port of the Access Point.")
         self.__ap_address = ap_address
-        self.__socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
-        self.__socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.__socket.bind(('0.0.0.0', 3333))
-        self.__disable_rx = disable_rx
+        self.__local_address = ('0.0.0.0', 3333)  # local IP-Address and local Port
+
+        if state is BusState.ACTIVE or state is BusState.PASSIVE:
+            self.__state = state
+        else:
+            raise ValueError("BusState must be Active or Passive")
+
+        if bitrate in cannelloni_bitrates:
+            self.__bitrate = cannelloni_bitrates[bitrate]
+        else:
+            raise ValueError("Invalid bitrate {}".format(bitrate))
+
+        if filter is True:
+            self.__is_extended = is_extended
+            self.__start_id = start_id
+            self.__end_id = end_id
+
+        self.__config = {
+            "ap_address": self.__ap_address,
+            "local_address": self.__local_address,
+            "bitrate": self.__bitrate,
+            "can_mode": can_mode,  # TODO: use state from basic.py or can.py?
+            "filter": filter,
+            "is_extended": is_extended,
+            "start_id": start_id,
+            "end_id": end_id
+        }
+
+        # get cannelloni device
+        self.__cannelloni = Cannelloni(local_address=self.__config["local_address"],
+                                       ap_address=self.__config["ap_address"])
+
+        # init buffers
         self._udp_rx_packet_buf = bytearray()
         self.tx_buffer = queue.Queue()
-        self.rx_buffer = queue.Queue()    # TODO: queue or deque(maybe faster?)
-
-        # TODO: set bit rate
+        self.rx_buffer = queue.Queue()  # TODO: queue or deque(maybe faster?)
+        self.__disable_rx = disable_rx
 
         if do_open:
             self.open()
@@ -155,7 +173,8 @@ class CannelloniBus(BusABC):
             self.__rcv_internal_thread = MyThread(func=self._recv_internal)
             self.__rcv_internal_thread.start()
 
-        self.timer = MyTimer(0.03)
+        # start the send timer
+        self.timer = CANNELLONISendTimer(0.03)  # send messages in the given interval
         self.timer.run()
 
         self.__snd_internal_thread = MyThread(func=self._send_internal)
@@ -163,15 +182,17 @@ class CannelloniBus(BusABC):
 
         super(CannelloniBus, self).__init__(ap_address, **kwargs)
 
-    def write(self, string):        # TODO: (needed?)
-        self.__socket.sendto(binascii.hexlify(string), self.__ap_address)
-
     def open(self):
         """
-        Sends an init Message peer UDP to the Access Point.
+                Init the CAN channel on the cannelloni device.
         """
-        init_message = bytes("Cannelloni", "utf-8")
-        self.__socket.sendto(init_message, self.__ap_address)  # send init message to the Access Point
+        self.__cannelloni.init_can(bitrate=self.__config["bitrate"],
+                                   can_mode=self.__config["can_mode"],
+                                   filter=self.__config["filter"],
+                                   is_extended=self.__config["is_extended"],
+                                   start_id=self.__config["start_id"],
+                                   end_id=self.__config["end_id"]
+                                   )
 
     def close(self):        # TODO: adapt on socket
         pass
@@ -197,7 +218,7 @@ class CannelloniBus(BusABC):
 
             # return it, if it matches
             if msg and (already_filtered or self._matches_filters(msg)):
-                LOG.log(self.RECV_LOGGING_LEVEL, 'Received: %s', msg)
+                logger.log(self.RECV_LOGGING_LEVEL, 'Received: %s', msg)
                 return msg
 
             # if not, and timeout is None, try indefinitely
@@ -216,85 +237,57 @@ class CannelloniBus(BusABC):
                     return None
 
     def _recv_internal(self, timeout=None):
-        self.__socket.setblocking(False)
+        data = bytearray()
 
-        can_id = None
-        remote = False
-        extended = False
-        error_frame = False
-        data = []
+        cannelloni_rcv_hdr, self._udp_rx_packet_buf = self.__cannelloni.recv(timeout=timeout)
+        # if not cannelloni_rcv_hdr and self._udp_rx_packet_buf:
+        data.clear()
+        try:
+            received_frames_count = cannelloni_rcv_hdr.count
+        except AttributeError:
+            received_frames_count = 0
 
-        ready = select.select([self.__socket], [], [], timeout)
-        if ready[0]:
-            try:
-                self._udp_rx_packet_buf, server = self.__socket.recvfrom(self.CANNELLONI_UDP_RX_PACKET_BUF_LEN)
-            except OSError:
-                return None, False
-        else:
-            return None, False
-
-        rcv_hdr = CannelloniDataPacket()
-        (rcv_hdr.version, rcv_hdr.op_code, rcv_hdr.seq_no) = struct.unpack("BBB", self._udp_rx_packet_buf[0:3])
-        rcv_hdr.count = struct.unpack("H", self._udp_rx_packet_buf[3:5])
-
-        rcv_hdr.count = socket.ntohs(rcv_hdr.count[0])
-
-        rcv_len = len(self._udp_rx_packet_buf)
-        if rcv_len < self.CANNELLONI_DATA_PACKET_BASE_SIZE:
-            print("Did not receive enough data", file=sys.stderr)
-            return None, False
-
-        if rcv_hdr.version != self.CANNELLONI_FRAME_VERSION:
-            print("Recieved wrong cannelloni frame version", file=sys.stderr)
-            return None, False
-
-        if rcv_hdr.op_code != OpCodes.DATA.value:
-            print("Received wrong op code", file=sys.stderr)
-            return None, False
-
-        received_frames_count = rcv_hdr.count
-        if received_frames_count == 0:
-            print("No frame received", file=sys.stderr)
-            return None, False
-
-        pos_left = 5
-        pos_right = 9
+        pos_left = self.CANNELLONI_DATA_PACKET_BASE_SIZE
+        pos_right = self.CANNELLONI_DATA_PACKET_BASE_SIZE + 4
         for i in range(0, received_frames_count):
             can_id = struct.unpack("I", self._udp_rx_packet_buf[pos_left:pos_right])
             can_id = socket.ntohl(can_id[0])
 
-            flags = self.CAN_MSG_FLAG_NONE
-            if can_id & self.CAN_ERR_FLAG:
+            if can_id & CANNELLONI_CAN_ERR_FLAG:
                 error_frame = True
-
-            if can_id & self.CAN_EFF_FLAG:
-                flags = flags | self.CAN_MSG_FLAG_EXTD
-                extended = True
-
-            if can_id & self.CAN_RTR_FLAG:
-                flags = flags | self.CAN_MSG_FLAG_RTR
-                remote = True
-
-            if flags & self.CAN_MSG_FLAG_EXTD:
-                can_id = can_id & self.CAN_EFF_MASK
             else:
-                can_id = can_id & self.CAN_SFF_MASK
+                error_frame = False
+
+            if can_id & CANNELLONI_CAN_EFF_FLAG:
+                extended_frame = True
+            else:
+                extended_frame = False
+
+            if can_id & CANNELLONI_CAN_RTR_FLAG:
+                remote_frame = True
+            else:
+                remote_frame = False
+
+            if extended_frame:
+                can_id = can_id & CANNELLONI_CAN_EFF_MASK
+            else:
+                can_id = can_id & CANNELLONI_CAN_SFF_MASK
 
             pos_left = pos_right
             pos_right = pos_right + 1
             data_length_code = struct.unpack("B", self._udp_rx_packet_buf[pos_left:pos_right])
-            data_length_code = data_length_code[0]
+            data_length_code = data_length_code[0]  # TODO:redundant try [0]
 
             pos_left = pos_right
             pos_right = pos_left + data_length_code
-            if (flags & self.CAN_MSG_FLAG_RTR) == 0:
+            if not remote_frame:
                 data = bytearray(self._udp_rx_packet_buf[pos_left:pos_right])
 
             if can_id is not None:
                 message = Message(arbitration_id=can_id,
-                                  is_extended_id=extended,
+                                  is_extended_id=extended_frame,
                                   timestamp=time.time(),  # TODO: maybe use timestamp from ESP32
-                                  is_remote_frame=remote,
+                                  is_remote_frame=remote_frame,
                                   is_error_frame=error_frame,
                                   dlc=data_length_code,
                                   data=data)
@@ -305,8 +298,11 @@ class CannelloniBus(BusABC):
             pos_left = pos_right
             pos_right = pos_right + 4
 
+    def send(self, msg, timeout=None):
+        time.sleep(0.00033)
+        self.tx_buffer.put(msg)
+
     def _send_internal(self):
-        self.__socket.setblocking(False)
         can_messages = list()
 
         queue_size = self.tx_buffer.qsize()
@@ -314,80 +310,23 @@ class CannelloniBus(BusABC):
             while queue_size > 0:
                 can_messages.append(self.tx_buffer.get())
                 queue_size = queue_size - 1
-            udp_tx_packet_buf, packet_size = self.__cannelloni_build_packet(can_messages, len(can_messages))
 
-            if packet_size < 0:
-                print("cannelloni build packet failed", file=sys.stderr)
-            ready = select.select([], [self.__socket], [], None)
-            if ready[1]:
-                send = self.__socket.sendto(udp_tx_packet_buf, self.__ap_address)  # TODO: try catch?
-                if send < 0:
-                    print("sento error: %s" % send, file=sys.stderr)
+            self.__cannelloni.send(can_messages)
+
             can_messages.clear()
             self.timer.clear()
             self.timer.reset()
 
-    def send(self, msg, timeout=None):
-        time.sleep(0.00033)
-        self.tx_buffer.put(msg)
-
-    def __cannelloni_build_packet(self, can_msg, frame_count):
-        """
-        Gets a defined number of CAN messages and builds an cannelloni packet.
-
-        :param can_msg: CAN messages
-        :type can_msg: [int]
-        :param frame_count: number of CAN messages in can_msg
-        :type frame_count: int
-
-        :return udp_tx_packet_buf: cannelloni packet for transmitting peer udp
-        :rtype udp_tx_packet_buf: bytes
-        :return packet_size: size of the udp_tx_packet_buf
-        :rtype packet_size: int
-        """
-
-        snd_hdr = CannelloniDataPacket()
-        snd_hdr.version = self.CANNELLONI_FRAME_VERSION
-        snd_hdr.op_code = OpCodes.DATA.value
-        snd_hdr.seq_no = self.__seq_no
-        snd_hdr.count = 0
-        snd_hdr.count = socket.htons(frame_count)
-
-        self.__seq_no = self.__seq_no + 1
-        if self.__seq_no > 0xFF:
-            self.__seq_no = 0
-
-        udp_tx_packet_buf = struct.pack('BBB', snd_hdr.version, snd_hdr.op_code, 0xff)
-        udp_tx_packet_buf = udp_tx_packet_buf + struct.pack('H', snd_hdr.count)
-
-        for i in range(0, frame_count):
-            can_id = can_msg[i].arbitration_id
-            if can_msg[i].is_extended_id:
-                can_id = can_id | self.CAN_EFF_FLAG
-            if can_msg[i].is_remote_frame:
-                can_id = can_id | self.CAN_RTR_FLAG
-
-            can_id = socket.htonl(can_id)
-
-            udp_tx_packet_buf = udp_tx_packet_buf + struct.pack("I", can_id)
-            udp_tx_packet_buf = udp_tx_packet_buf + struct.pack("B", can_msg[i].dlc)
-
-            if not can_msg[i].is_remote_frame:
-                for n in range(0, can_msg[i].dlc):
-                    udp_tx_packet_buf = udp_tx_packet_buf + struct.pack("B", can_msg[i].data[n])
-
-        packet_size = len(udp_tx_packet_buf)
-        return udp_tx_packet_buf, packet_size
-
     def get_socket(self):
-        return self.__socket
+        return self.__cannelloni.get_socket()
 
     def shutdown(self):
-        self.__snd_internal_thread.cancel()
+        time.sleep(2)
         if not self.__disable_rx:
             self.__rcv_internal_thread.cancel()
+        self.__snd_internal_thread.cancel()
         #self.__rcv_internal_thread.join()
         #self.__snd_internal_thread.join()
-
-        self.__socket.close()
+        self.__cannelloni.shutdown()
         self.close()
+
